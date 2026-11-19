@@ -1,0 +1,100 @@
+name: Build and publish YuanshenStart
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          architecture: x64
+
+      - name: Install PyInstaller
+        shell: pwsh
+        run: python -m pip install "pyinstaller>=6.15,<7"
+
+      - name: Build Windows EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name YuanshenStart --icon "${{ github.workspace }}\app.ico" --add-data "${{ github.workspace }}\logo.png;." --distpath dist --workpath build app.py
+          if (-not (Test-Path "dist\YuanshenStart.exe")) {
+            throw "EXE build did not produce dist\YuanshenStart.exe"
+          }
+
+      - name: Make signed-by-hash release manifest and install config
+        shell: pwsh
+        run: python publish_github.py
+
+      - name: Package first-install portable ZIP
+        shell: pwsh
+        run: |
+          Copy-Item dist\YuanshenStart.exe release\YuanshenStart.exe
+          Compress-Archive -Path release\YuanshenStart.exe,release\update_url.txt -DestinationPath release\YuanshenStart_Windows.zip -Force
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith("v")) {
+            throw "Run from a version tag (for example v3.9), not from a branch."
+          }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag "release/YuanshenStart.exe" "release/YuanshenStart_Windows.zip" --clobber
+          } else {
+            gh release create $tag "release/YuanshenStart.exe" "release/YuanshenStart_Windows.zip" --title "沅神启动 $tag" --notes-file "更新日志.md" --latest
+          }
+
+      - name: Store latest.json for Pages deployment
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-pages-latest-json
+          path: site/
+          if-no-files-found: error
+
+  deploy-pages:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: Get latest.json
+        uses: actions/download-artifact@v4
+        with:
+          name: github-pages-latest-json
+          path: site
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy latest.json
+        id: publish
+        uses: actions/deploy-pages@v4
