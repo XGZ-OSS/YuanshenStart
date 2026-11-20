@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP = "沅神启动"
-APP_VERSION = "3.9"
+APP_VERSION = "4.0"
 BG = "#F2F9F1"
 CARD = "#FFFFFF"
 INK = "#365C45"
