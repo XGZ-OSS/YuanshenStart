@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP = "沅神启动"
-APP_VERSION = "4.0"
+APP_VERSION = "4.1"
 BG = "#F2F9F1"
 CARD = "#FFFFFF"
 INK = "#365C45"
@@ -188,7 +188,7 @@ def normalize_data(raw):
                     raise ValueError("玩法次数无效")
             if field in ("gift_records", "play_records"):
                 if not isinstance(row.get("time"), str):
-                    raise ValueError("记录时间无效")
+                    raise ValueError(f"{field} 中 ID {row['id']} 的记录时间无效：{row.get('time')!r}")
                 row.setdefault("scene", "默认场次")
                 if not isinstance(row["scene"], str):
                     raise ValueError("记录场次无效")
@@ -206,6 +206,54 @@ def normalize_data(raw):
     d["next_id"] = max(next_id, max(seen, default=0) + 1)
     d["format_version"] = 2
     return d
+
+
+def normalize_deepseek_legacy(raw):
+    """Import-only DeepSeek converter; never changes the selected source JSON.
+
+    Do not invent dates for missing/invalid timestamps: tell the user the exact row.
+    Ordinary v4.1 file loading still uses the strict normalize_data validator.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("旧版文件根节点必须是 JSON 对象")
+    converted = copy.deepcopy(raw)
+    changes = []
+    for table, title in (("gift_records", "收礼记录"), ("play_records", "玩法记录")):
+        records = converted.get(table, [])
+        if not isinstance(records, list):
+            raise ValueError(f"{title}不是列表")
+        for index, record in enumerate(records, 1):
+            if not isinstance(record, dict):
+                raise ValueError(f"{title}第 {index} 条不是对象")
+            value = record.get("time")
+            label = f"{title}第 {index} 条（ID {record.get('id', '未知')}）"
+            if isinstance(value, str):
+                v = value.strip()
+                if not v:
+                    raise ValueError(f"{label}缺少记录时间；请核对原始文件，未自动编造时间")
+                v = v.replace("年", "-").replace("月", "-").replace("日", " ")
+                v = v.replace("/", "-").replace("T", " ")
+                try:
+                    # Support ISO-8601 offsets and fractional seconds.
+                    parsed = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise ValueError(f"{label}的时间无法识别：{value!r}") from exc
+            elif type(value) in (int, float):
+                try:
+                    seconds = value / 1000 if abs(value) >= 100_000_000_000 else value
+                    parsed = datetime.fromtimestamp(seconds)
+                except (ValueError, OverflowError, OSError) as exc:
+                    raise ValueError(f"{label}的时间戳无效：{value!r}") from exc
+            else:
+                raise ValueError(f"{label}的时间无效：{value!r}；请核对原始记录")
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone()
+            canonical = parsed.strftime("%Y-%m-%d %H:%M:%S")
+            if canonical != value:
+                changes.append(f"{label}：{value!r} -> {canonical}")
+            record["time"] = canonical
+    result = normalize_data(converted)
+    return result, changes
 
 
 class YuanshenApp(ttk.Frame):
@@ -1447,7 +1495,7 @@ class YuanshenApp(ttk.Frame):
         detail = ttk.Frame(outer, style="Card.TFrame", padding=14)
         detail.grid(row=1, column=1, sticky="nsew")
         choices = {
-            "文件": [("继承 DeepSeek v3.4 数据…", "从旧版默认目录读取积分数据，导入前备份当前数据。", self._import_deepseek),
+            "文件": [("导入 DeepSeek 旧版数据…", "自动转换旧版字段和时间；导入前预览并备份现有数据。", self._import_deepseek),
                    ("打开数据文件…", "从外部 JSON 文件导入完整数据。", self._open_json_file),
                    ("打开数据文件夹", "打开自动保存的数据目录。", self._open_data_folder),
                    ("备份管理…", "查看历史备份、恢复备份。", self._backup_manager),
@@ -1862,7 +1910,8 @@ class YuanshenApp(ttk.Frame):
 
     def _import_legacy_path(self, path):
         try:
-            incoming = self._read_json(path)
+            with Path(path).open("r", encoding="utf-8-sig") as handle:
+                incoming, conversions = normalize_deepseek_legacy(json.load(handle))
             # 检查对象关联但保留无效对象供后续核对
             member_ids = {x["id"] for x in incoming["members"]}
             gift_ids = {x["id"] for x in incoming["gifts"]}
@@ -1884,19 +1933,22 @@ class YuanshenApp(ttk.Frame):
             f"{len(incoming['gameplays'])} 种玩法，"
             f"{len(incoming['gift_records']) + len(incoming['play_records'])} 条收支记录。"
             + (f"\\n其中 {orphans} 条记录关联对象缺失，统计时将跳过。" if orphans else "")
-            + "\\n\\n将替换当前新版数据，导入前会保存当前数据副本。继续吗？",
+            + (f"\\n已规范化 {len(conversions)} 条记录时间。" if conversions else "")
+            + f"\\n来源：{path}"
+            + "\\n\\n将替换当前新版数据。会先单独备份当前积分和所选旧文件。继续吗？",
             parent=self._dialog_parent(),
         ):
             return
-        # 当前新版数据的独立快照：即使自动保存尚未执行，也能完整回退。
-        pre = self.data_dir / "积分数据.导入前.json"
-        tmp = self.data_dir / "积分数据.导入前.json.tmp"
+        # Every import gets a unique pre-import snapshot: no old backup overwritten.
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        pre = self.data_dir / f"积分数据.导入前-{stamp}.json"
+        legacy_backup = self.data_dir / f"积分数据.DeepSeek来源-{stamp}.json"
         try:
-            with tmp.open("w", encoding="utf-8") as f:
+            with pre.open("x", encoding="utf-8") as f:
                 f.write(self._json_text())
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, pre)
+            shutil.copy2(path, legacy_backup)
         except OSError as exc:
             messagebox.showerror("无法创建导入前备份", str(exc), parent=self._dialog_parent())
             return
@@ -1908,7 +1960,8 @@ class YuanshenApp(ttk.Frame):
         messagebox.showinfo(
             "导入完成",
             "DeepSeek 原始文件未修改。\\n新版数据将在 300ms 内自动保存。"
-            "\\n导入前副本：积分数据.导入前.json",
+            f"\\n导入前备份：{pre.name}"
+            f"\\n旧版来源备份：{legacy_backup.name}",
             parent=self._dialog_parent(),
         )
 
