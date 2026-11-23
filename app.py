@@ -2,7 +2,7 @@
 """沅神启动 | Python 3.14 + tkinter/ttk clam | 单文件、纯标准库。
 
 可选：把原图以「logo.png」放到本文件同目录。
-data/积分数据.json 会自动保存；可用「数据位置.txt」第一行修改数据目录。
+默认保存到 %LocalAppData%/沅神启动/积分数据.json；与 DeepSeek v3.4 共用目录。
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP = "沅神启动"
-APP_VERSION = "4.1"
+APP_VERSION = "4.2"
 BG = "#F2F9F1"
 CARD = "#FFFFFF"
 INK = "#365C45"
@@ -87,8 +87,7 @@ def timestamp():
 def empty_data():
     return {"format_version": 2, "settings": copy.deepcopy(DEFAULT_SETTINGS),
             "next_id": 1, "members": [], "gifts": [], "gameplays": [],
-            "gift_records": [], "play_records": [], "scenes": ["默认场次"],
-            "active_scene": "默认场次"}
+            "gift_records": [], "play_records": []}
 
 
 def number(tenths):
@@ -286,7 +285,6 @@ class YuanshenApp(ttk.Frame):
         self.dirty = False
         self.load_message = ""
         self.active_section = "成员"
-        self.scene_var = tk.StringVar(value="全部场次")
         self.member_var = tk.StringVar()
         self.quantity_var = tk.IntVar(value=1)
         self.status_var = tk.StringVar(value="欢迎使用沅神启动")
@@ -308,7 +306,6 @@ class YuanshenApp(ttk.Frame):
         self._build_tabs()
         self._build_content()
         self._build_statusbar()
-        self._update_scene_choices()
         self._refresh_all()
         if self.load_message:
             self._status(self.load_message)
@@ -414,18 +411,17 @@ class YuanshenApp(ttk.Frame):
         s.configure("Mint.TSeparator", background=BORDER)
 
     def _locate_data_dir(self):
-        path = self.base_dir / "数据位置.txt"
-        if path.is_file():
-            try:
-                first = path.read_text(encoding="utf-8-sig").splitlines()
-                configured = first[0].strip().strip('"') if first else ""
-            except (OSError, UnicodeError):
-                configured = ""
-            directory = Path(configured).expanduser() if configured else Path("data")
+        """DeepSeek v3.4 compatible per-Windows-user storage.
+
+        A new release never uses its EXE directory for live data. Older portable
+        data is picked up only if no current user data exists.
+        """
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            directory = Path(local) / "沅神启动"
         else:
-            directory = Path("data")
-        if not directory.is_absolute():
-            directory = self.base_dir / directory
+            # Non-Windows development fallback; Windows always has LOCALAPPDATA.
+            directory = Path.home() / "AppData" / "Local" / "沅神启动"
         directory.mkdir(parents=True, exist_ok=True)
         return directory.resolve()
 
@@ -468,7 +464,9 @@ class YuanshenApp(ttk.Frame):
             except OSError:
                 pass
 
-        # 当前程序文件夹的上两级：典型情况为“下载/新版文件夹/release/”。
+        # v4.0/v4.1 live in EXE-neighbor data; include current folder as well.
+        register(self.base_dir / "data" / DATA_NAME)
+        register(self.base_dir / "release" / "data" / DATA_NAME)
         for folder in (self.base_dir.parent, self.base_dir.parent.parent):
             for sub in ("data", "release/data", "发布/data"):
                 register(folder / sub / DATA_NAME)
@@ -658,7 +656,6 @@ class YuanshenApp(ttk.Frame):
         self.redo_stack.append(self._snapshot())
         self.data = self.undo_stack.pop()
         self._changed("已撤销")
-        self._update_scene_choices()
 
     def _redo(self, event=None):
         if not self.redo_stack:
@@ -667,7 +664,6 @@ class YuanshenApp(ttk.Frame):
         self.undo_stack.append(self._snapshot())
         self.data = self.redo_stack.pop()
         self._changed("已重做")
-        self._update_scene_choices()
 
     def _save_shortcut(self, event=None):
         self._save_now()
@@ -684,13 +680,8 @@ class YuanshenApp(ttk.Frame):
         return {row["id"]: row for row in self.data[category]}
 
     def _filtered(self, records):
-        scene = self.scene_var.get()
-        if scene == "仅本场":
-            start = self.data["settings"]["session_start"]
-            return [r for r in records if not start or r["time"] >= start]
-        if scene == "全部场次":
-            return records
-        return [r for r in records if r["scene"] == scene]
+        # Always show all records: no sessions, scene filters, or hidden points.
+        return records
 
     def _valid_records(self, type_name, filtered=True):
         field = "gift_records" if type_name == "gift" else "play_records"
@@ -788,15 +779,6 @@ class YuanshenApp(ttk.Frame):
         ttk.Label(branding, text=APP, style="Brand.TLabel").pack(side="left")
         right = ttk.Frame(bar, style="App.TFrame")
         right.grid(row=0, column=2, sticky="e")
-        ttk.Label(right, text="场次", style="Muted.TLabel").pack(side="left", padx=(0, 5))
-        self.scene_combo = ttk.Combobox(right, textvariable=self.scene_var,
-                                        state="readonly", width=13, style="Mint.TCombobox")
-        self.scene_combo.pack(side="left", padx=(0, 6))
-        self.scene_combo.bind("<<ComboboxSelected>>", self._scene_changed)
-        ttk.Button(right, text="+ 场次", style="Compact.TButton",
-                   command=self._add_scene).pack(side="left", padx=3)
-        ttk.Button(right, text="标记新场次", style="Compact.TButton",
-                   command=self._mark_session).pack(side="left", padx=(3, 12))
         for icon, action in (
             ("plus", self._open_quick),
             ("home", self._show_welcome),
@@ -937,7 +919,7 @@ class YuanshenApp(ttk.Frame):
         title = {"成员": "成员管理", "礼物": "礼物管理", "玩法": "玩法管理",
                  "积分统计": "积分排行榜"}[section]
         subtitles = {"成员": "管理大家的小积分", "礼物": "礼物价值、倍率和累计记录",
-                     "玩法": "玩法参与与累计消耗", "积分统计": "按当前场次与倍率实时排行"}
+                     "玩法": "玩法参与与累计消耗", "积分统计": "查看全部历史积分与排行"}
         header = ttk.Frame(page, style="Soft.TFrame")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         header.columnconfigure(0, weight=1)
@@ -1260,56 +1242,10 @@ class YuanshenApp(ttk.Frame):
             self.data[key] = [r for r in self.data[key] if r["id"] not in ids]
         self._changed("记录已删除")
 
-    def _add_scene(self):
-        dlg = tk.Toplevel(self.root)
-        dlg.title("新增场次")
-        dlg.configure(bg=CARD)
-        self._center_dialog(dlg, 340, 160)
-        inner = ttk.Frame(dlg, style="Card.TFrame", padding=20)
-        inner.pack(fill="both", expand=True)
-        ttk.Label(inner, text="新场次名称", style="Card.TLabel").pack(anchor="w")
-        var = tk.StringVar()
-        ttk.Entry(inner, textvariable=var, style="Mint.TEntry").pack(fill="x", pady=8)
-        def add():
-            name = var.get().strip()
-            if not name or name in self.data["scenes"] or name in ("全部场次", "仅本场"):
-                messagebox.showwarning("提示", "请输入未使用的场次名称", parent=dlg)
-                return
-            self._remember()
-            self.data["scenes"].append(name)
-            self.data["active_scene"] = name
-            self.scene_var.set(name)
-            dlg.destroy()
-            self._update_scene_choices()
-            self._changed("已创建场次：" + name)
-        ttk.Button(inner, text="确定", style="Primary.TButton",
-                   command=add).pack(anchor="e", pady=5)
-
-    def _mark_session(self):
-        self._remember()
-        self.data["settings"]["session_start"] = timestamp()
-        self.scene_var.set("仅本场")
-        self._changed("已标记新场次起点：" + self.data["settings"]["session_start"])
-
-    def _update_scene_choices(self):
-        self.scene_combo.configure(values=["全部场次", "仅本场"] + self.data["scenes"])
-        if self.scene_var.get() not in ["全部场次", "仅本场"] + self.data["scenes"]:
-            self.scene_var.set("全部场次")
-
-    def _scene_changed(self, event=None):
-        chosen = self.scene_var.get()
-        if chosen not in ("全部场次", "仅本场"):
-            if chosen != self.data["active_scene"]:
-                self._remember()
-                self.data["active_scene"] = chosen
-                self._schedule_save()
-        self._refresh_all()
-        self._status("已切换筛选：" + chosen)
-
     def _record(self, kind, member_id, item_id, count):
         self._remember()
         base = {"id": self._new_id(), "member_id": member_id,
-                "time": timestamp(), "scene": self.data["active_scene"]}
+                "time": timestamp()}
         if kind == "gift":
             base.update(gift_id=item_id, count=count)
             self.data["gift_records"].append(base)
@@ -1336,8 +1272,6 @@ class YuanshenApp(ttk.Frame):
         body = ttk.Frame(win, style="Card.TFrame", padding=18)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="快速登记", style="Group.TLabel").pack(anchor="w")
-        ttk.Label(body, text="记录归属：" + self.data["active_scene"],
-                  style="CardMuted.TLabel").pack(anchor="w", pady=(4, 13))
         ttk.Label(body, text="成员", style="Card.TLabel").pack(anchor="w")
         member_ids = {m["name"]: m["id"] for m in self.data["members"]}
         names = list(member_ids)
@@ -1499,20 +1433,16 @@ class YuanshenApp(ttk.Frame):
                    ("打开数据文件…", "从外部 JSON 文件导入完整数据。", self._open_json_file),
                    ("打开数据文件夹", "打开自动保存的数据目录。", self._open_data_folder),
                    ("备份管理…", "查看历史备份、恢复备份。", self._backup_manager),
-                   ("导入成员名单 CSV…", "第一列名字，第二列基础积分（可选）。", self._import_csv),
-                   ("导出排行 CSV…", "导出当前筛选下的完整积分排行榜。", self._export_csv),
-                   ("重新载入当前数据 F5", "当另一台电脑修改了共享数据后，重新读取磁盘文件。", self._reload_current_file),
-                   ("立即保存", "将内存数据立刻安全写入磁盘。", self._save_now)],
+                   ("导出排行 CSV…", "导出全部积分排行榜。", self._export_csv)],
             "设置": [("礼物倍率", "", None),
                    ("在线更新", "检查服务器上的新版本并选择是否升级。", self._check_updates),
                    ("更新地址", "设置可信 HTTPS 更新源。", self._edit_update_url),
-                   ("场次说明", "「仅本场」只统计标记的时间以后发生的记录。", None),
                    ("保存说明", "数据变更 300ms 内自动保存；最多保留 10 份历史备份。", None)],
             "帮助": [("版本信息", f"当前程序版本：v{APP_VERSION}，可在设置中检查更新。", None),
                    ("快速登记", "顶部「+」打开；数字键 1～9 登记对应礼物。", None),
                    ("积分规则", "礼物价值 × 礼物倍率 × 数量；玩法花费 × 次数。", None),
                    ("键盘快捷键", "Ctrl+Z 撤销；Ctrl+Y 重做；Ctrl+S 立即保存。", None),
-                   ("数据位置", "在程序目录建立「数据位置.txt」，第一行写数据目录。", None)],
+                   ("数据位置", "与 DeepSeek 一致：%LocalAppData%\\沅神启动\\积分数据.json", None)],
         }[category]
         def choose(index):
             for child in detail.winfo_children():
@@ -1785,7 +1715,6 @@ class YuanshenApp(ttk.Frame):
         self.data = reloaded
         self.last_saved_text = self._json_text()
         self.dirty = False
-        self._update_scene_choices()
         self._refresh_all()
         self._status("已从磁盘重新载入数据")
 
@@ -1871,8 +1800,7 @@ class YuanshenApp(ttk.Frame):
             if self.autosave_job is not None:
                 self.after_cancel(self.autosave_job)
                 self.autosave_job = None
-            self._update_scene_choices()
-            self._refresh_all()
+                self._refresh_all()
             self._status("备份已恢复；恢复前数据已保留")
             refill()
         ttk.Button(commands, text="打开数据文件夹", style="Secondary.TButton",
@@ -1954,8 +1882,6 @@ class YuanshenApp(ttk.Frame):
             return
         self._remember()
         self.data = incoming
-        self.scene_var.set("全部场次")
-        self._update_scene_choices()
         self._changed("已继承旧版数据，正在自动保存")
         messagebox.showinfo(
             "导入完成",
@@ -1987,7 +1913,6 @@ class YuanshenApp(ttk.Frame):
             return
         self._remember()
         self.data = incoming
-        self._update_scene_choices()
         self._changed("已导入 JSON 数据，正在自动保存")
 
     def _import_csv(self):
