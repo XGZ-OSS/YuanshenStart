@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP = "沅神启动"
-APP_VERSION = "4.2"
+APP_VERSION = "4.3"
 BG = "#F2F9F1"
 CARD = "#FFFFFF"
 INK = "#365C45"
@@ -301,6 +301,11 @@ class YuanshenApp(ttk.Frame):
         self._load_at_startup()
         self.update_events = queue.Queue()
         self.update_busy = False
+        self.update_dialog = None
+        self.update_progress = None
+        self.update_progress_value = None
+        self.update_progress_text = None
+        self.update_progress_detail = None
 
         self._build_topbar()
         self._build_tabs()
@@ -1576,6 +1581,114 @@ class YuanshenApp(ttk.Frame):
                 self.update_events.put(("error", str(exc), manual))
         threading.Thread(target=work, daemon=True).start()
 
+    def _show_update_notes(self, info):
+        """Show release notes and let the user decide before downloading."""
+        parent = self._dialog_parent()
+        dialog = tk.Toplevel(parent)
+        dialog.title("沅神启动 · 版本更新")
+        dialog.configure(bg=BG)
+        self._center_dialog(dialog, 610, 450, parent=parent)
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+        header = ttk.Frame(dialog, style="Card.TFrame", padding=20)
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text=f"发现新版本 v{info['version']}",
+                  style="Group.TLabel").pack(anchor="w")
+        ttk.Label(header, text=f"当前版本 v{APP_VERSION}  →  v{info['version']}",
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(7, 0))
+        body = ttk.Frame(dialog, style="Card.TFrame", padding=(20, 12))
+        body.grid(row=1, column=0, sticky="nsew", padx=0, pady=4)
+        body.rowconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1)
+        ttk.Label(body, text="本次更新项目", style="Group.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 8))
+        text_box = tk.Text(body, wrap="word", relief="flat", height=10,
+                           bg=CARD, fg=TEXT, font=(FONT, 11),
+                           highlightthickness=0, borderwidth=0)
+        text_box.grid(row=1, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=text_box.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        text_box.configure(yscrollcommand=scrollbar.set)
+        text_box.insert("1.0", info.get("notes", "").strip() or "本次版本暂无更新说明。")
+        text_box.configure(state="disabled")
+        ttk.Label(body, text="确认后下载；下载完成会校验完整性、保存积分，并重新启动。",
+                  style="CardMuted.TLabel").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        footer = ttk.Frame(dialog, style="Card.TFrame", padding=(20, 14))
+        footer.grid(row=2, column=0, sticky="ew")
+        result = {"install": False}
+        def finish(accept):
+            result["install"] = accept
+            dialog.destroy()
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        ttk.Button(footer, text="暂不更新", style="Secondary.TButton",
+                   command=lambda: finish(False)).pack(side="right")
+        ttk.Button(footer, text="下载并更新", style="Primary.TButton",
+                   command=lambda: finish(True)).pack(side="right", padx=(0, 10))
+        dialog.wait_window()
+        return result["install"]
+
+    def _open_update_progress(self, version):
+        """Modal progress UI. Network thread sends updates only through queue."""
+        dialog = tk.Toplevel(self.root)
+        self.update_dialog = dialog
+        dialog.title("沅神启动 · 更新进度")
+        dialog.configure(bg=BG)
+        self._center_dialog(dialog, 560, 240)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        # Prevent closing while a partial EXE is being downloaded/verified.
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._status("更新正在进行，请稍候"))
+        frame = ttk.Frame(dialog, style="Card.TFrame", padding=25)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=f"正在更新到 v{version}",
+                  style="Group.TLabel").pack(anchor="w", pady=(0, 10))
+        self.update_progress_text = tk.StringVar(value="连接下载服务器…")
+        ttk.Label(frame, textvariable=self.update_progress_text,
+                  style="Card.TLabel").pack(anchor="w", pady=(0, 12))
+        self.update_progress_value = tk.DoubleVar(value=0)
+        self.update_progress = ttk.Progressbar(
+            frame, variable=self.update_progress_value, maximum=100,
+            mode="indeterminate", length=480
+        )
+        self.update_progress.pack(fill="x")
+        self.update_progress.start(12)
+        self.update_progress_detail = tk.StringVar(value="正在准备下载")
+        ttk.Label(frame, textvariable=self.update_progress_detail,
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(10, 0))
+
+    def _close_update_progress(self):
+        if self.update_progress is not None:
+            try:
+                self.update_progress.stop()
+            except tk.TclError:
+                pass
+        if self.update_dialog is not None:
+            try:
+                self.update_dialog.grab_release()
+                self.update_dialog.destroy()
+            except tk.TclError:
+                pass
+        self.update_dialog = None
+        self.update_progress = None
+
+    def _apply_download_progress(self, received, total):
+        if self.update_progress is None:
+            return
+        if total and total > 0:
+            if str(self.update_progress["mode"]) != "determinate":
+                self.update_progress.stop()
+                self.update_progress.configure(mode="determinate")
+            percent = min(100, received * 100 / total)
+            self.update_progress_value.set(percent)
+            self.update_progress_text.set(f"正在下载… {percent:.1f}%")
+            self.update_progress_detail.set(
+                f"已下载 {received / 1048576:.1f} MB / {total / 1048576:.1f} MB")
+        else:
+            self.update_progress_text.set("正在下载更新文件…")
+            self.update_progress_detail.set(f"已下载 {received / 1048576:.1f} MB")
+
     def _download_update(self, info):
         if not getattr(sys, "frozen", False) or os.name != "nt":
             self.update_busy = False
@@ -1586,29 +1699,43 @@ class YuanshenApp(ttk.Frame):
         exe = Path(sys.executable).resolve()
         stage = exe.with_name(exe.name + ".new")
         temp = exe.with_name(exe.name + ".part")
+        self._open_update_progress(info["version"])
         self._status("正在下载 v" + info["version"])
         def work():
             try:
                 digest = hashlib.sha256()
                 size = 0
                 with urllib.request.urlopen(
-                    urllib.request.Request(info["exe_url"], headers={"User-Agent":"YuanshenStart/"+APP_VERSION}),
+                    urllib.request.Request(info["exe_url"], headers={
+                        "User-Agent": "YuanshenStart/" + APP_VERSION}),
                     timeout=25, context=ssl.create_default_context()
                 ) as response:
                     self._https_url(response.geturl())
-                    if int(response.headers.get("Content-Length", "0")) > 300 * 1024 * 1024:
+                    total = int(response.headers.get("Content-Length", "0"))
+                    if total > 300 * 1024 * 1024:
                         raise ValueError("更新文件过大")
                     with temp.open("wb") as target:
-                        while chunk := response.read(256 * 1024):
+                        last_report = 0.0
+                        while True:
+                            chunk = response.read(256 * 1024)
+                            if not chunk:
+                                break
                             size += len(chunk)
                             if size > 300 * 1024 * 1024:
                                 raise ValueError("更新文件过大")
                             target.write(chunk)
                             digest.update(chunk)
+                            now = time.monotonic()
+                            if now - last_report > 0.12 or (total and size >= total):
+                                self.update_events.put(("progress", size, total))
+                                last_report = now
                         target.flush()
                         os.fsync(target.fileno())
+                if total and size != total:
+                    raise ValueError(f"下载不完整：预期 {total} 字节，实际 {size} 字节")
                 if size < 10000 or temp.open("rb").read(2) != b"MZ":
                     raise ValueError("下载文件不是 Windows EXE")
+                self.update_events.put(("stage", "校验 SHA-256 文件完整性…", None))
                 if digest.hexdigest() != info["sha256"]:
                     raise ValueError("SHA-256 校验失败，已取消安装")
                 os.replace(temp, stage)
@@ -1622,7 +1749,7 @@ class YuanshenApp(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def _start_installer(self, stage):
-        """Windows PowerShell 等本进程关闭后原子换版，并保留 previous.exe。"""
+        """Replace EXE after exit; launch new PyInstaller instance with clean boot env."""
         exe = Path(sys.executable).resolve()
         staged = Path(stage).resolve()
         if staged.parent != exe.parent or not staged.is_file():
@@ -1630,24 +1757,42 @@ class YuanshenApp(ttk.Frame):
         def quote(p):
             return "'" + str(p).replace("'", "''") + "'"
         previous = exe.with_name(exe.stem + ".previous.exe")
-        script = ("$ErrorActionPreference='Stop'\n"
-                  f"$old={quote(exe)}\n$new={quote(staged)}\n"
-                  f"$backup={quote(previous)}\n$folder={quote(exe.parent)}\n"
-                  f"try {{ Wait-Process -Id {os.getpid()} -Timeout 90 -ErrorAction SilentlyContinue }} catch {{}}\n"
-                  "for ($i=0; $i -lt 60; $i++) {\n"
-                  " try {\n"
-                  "  [System.IO.File]::Replace($new,$old,$backup,$true)\n"
-                  "  Start-Process -FilePath $old -WorkingDirectory $folder\n"
-                  "  exit 0\n"
-                  " } catch { Start-Sleep -Milliseconds 800 }\n"
-                  "}\n")
+        # PowerShell is independent of the bundled Python process. Wait for the
+        # original process to finish before replacing the executable.
+        script = (
+            "$ErrorActionPreference='Stop'\n"
+            f"$old={quote(exe)}\n$new={quote(staged)}\n"
+            f"$backup={quote(previous)}\n$folder={quote(exe.parent)}\n"
+            f"$pidToWait={os.getpid()}\n"
+            "try { Wait-Process -Id $pidToWait -Timeout 90 -ErrorAction SilentlyContinue } catch {}\n"
+            "for ($i=0; $i -lt 60; $i++) {\n"
+            " try {\n"
+            "  [System.IO.File]::Replace($new,$old,$backup,$true)\n"
+            "  # Critical for PyInstaller onefile: reset the inherited extraction\n"
+            "  # context so the new EXE creates its own _MEI directory.\n"
+            "  Get-ChildItem Env:_PYI_* -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item ('Env:' + $_.Name) -ErrorAction SilentlyContinue }\n"
+            "  $env:PYINSTALLER_RESET_ENVIRONMENT='1'\n"
+            "  Start-Process -FilePath $old -WorkingDirectory $folder\n"
+            "  exit 0\n"
+            " } catch { Start-Sleep -Milliseconds 800 }\n"
+            "}\n"
+            "Write-Error '更新安装未完成，旧程序可能仍在运行或被安全软件锁定'\n"
+        )
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        clean_env = os.environ.copy()
+        # PyInstaller 6+ forwards _PYI_* bootloader flags to child processes.
+        # Remove them from the updater and explicitly mark fresh instance.
+        for key in tuple(clean_env):
+            if key.startswith("_PYI_") or key.startswith("PYINSTALLER_"):
+                clean_env.pop(key, None)
+        clean_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
         subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
              "-EncodedCommand", encoded],
             cwd=str(exe.parent),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=clean_env,
         )
 
     def _poll_updates(self):
@@ -1661,37 +1806,45 @@ class YuanshenApp(ttk.Frame):
                         if extra:
                             messagebox.showinfo("检查更新", f"当前已是最新版 v{APP_VERSION}",
                                                 parent=self._dialog_parent())
-                    elif messagebox.askyesno(
-                        "发现新版本", f"当前 v{APP_VERSION} → 最新 v{data['version']}\n\n"
-                        + data["notes"] + "\n\n确认下载并安装吗？",
-                        parent=self._dialog_parent(),
-                    ):
+                    elif self._show_update_notes(data):
                         self.update_busy = True
                         self._download_update(data)
+                elif event == "progress":
+                    self._apply_download_progress(data, extra)
+                elif event == "stage":
+                    if self.update_progress_text is not None:
+                        self.update_progress_text.set(data)
                 elif event in ("error", "download_error"):
                     self.update_busy = False
+                    self._close_update_progress()
                     self._status("联网更新失败：" + str(data)[:90])
                     if event == "download_error" or extra:
                         messagebox.showerror("在线更新失败", str(data),
                                              parent=self._dialog_parent())
                 elif event == "ready":
-                    self.update_busy = False
+                    if self.update_progress_text is not None:
+                        self.update_progress_text.set("下载完成，正在保存数据并安装…")
                     if not self._save_now():
+                        self._close_update_progress()
+                        self.update_busy = False
                         messagebox.showerror("无法更新", "积分数据未能保存，已取消替换程序。",
                                              parent=self._dialog_parent())
                         continue
                     try:
                         self._start_installer(data)
                     except (OSError, ValueError) as exc:
+                        self._close_update_progress()
+                        self.update_busy = False
                         messagebox.showerror("无法启动安装", str(exc),
                                              parent=self._dialog_parent())
                     else:
+                        self._close_update_progress()
                         self.root.destroy()
                         return
         except queue.Empty:
             pass
         if self.root.winfo_exists():
-            self.root.after(200, self._poll_updates)
+            self.root.after(100, self._poll_updates)
 
     def _reload_current_file(self, event=None):
         if self.dirty and not messagebox.askyesno(
