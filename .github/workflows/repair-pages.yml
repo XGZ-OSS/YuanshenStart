@@ -1,0 +1,60 @@
+
+name: Repair YuanshenStart Pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  repair-pages:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy1.outputs.page_url || steps.deploy2.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download v4.3 EXE
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download v4.3 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "YuanshenStart.exe" \
+            --dir dist
+
+      - name: Generate latest.json
+        env:
+          GITHUB_REF_NAME: v4.3
+        run: python publish_github.py
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Wait for artifact availability
+        run: sleep 25
+
+      - name: Deploy Pages - first attempt
+        id: deploy1
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+
+      - name: Wait before retry
+        if: steps.deploy1.outcome == 'failure'
+        run: sleep 25
+
+      - name: Deploy Pages - retry
+        id: deploy2
+        if: steps.deploy1.outcome == 'failure'
+        uses: actions/deploy-pages@v4
