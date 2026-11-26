@@ -30,10 +30,10 @@ jobs:
             --dir dist
 
       - name: Generate latest.json
-        env:
-          GITHUB_REF_NAME: v4.3
-        run: python publish_github.py
-
+        run: |
+          export GITHUB_REF_NAME=v4.3
+          python publish_github.py
+          
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
