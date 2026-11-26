@@ -2,7 +2,7 @@
 """Create a GitHub Pages latest.json + first-install update config.
 
 Called from a GitHub Actions Windows runner after building dist/YuanshenStart.exe.
-Requires GITHUB_REPOSITORY=OWNER/REPO and GITHUB_REF_NAME=v4.3.
+Requires GITHUB_REPOSITORY=OWNER/REPO and GITHUB_REF_NAME=v4.4.
 """
 import hashlib
 import json
@@ -16,7 +16,7 @@ def main():
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise SystemExit("Missing/invalid GITHUB_REPOSITORY (OWNER/REPO)")
     if not re.fullmatch(r"v\d+(?:\.\d+){1,3}", tag):
-        raise SystemExit("Release tag must look like v4.3 or v4.3.1.")
+        raise SystemExit("Release tag must look like v4.4 or v4.4.1.")
     expected_version = tag[1:]
     app_text = Path("app.py").read_text(encoding="utf-8")
     version_match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', app_text, re.M)

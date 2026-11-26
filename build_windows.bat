@@ -19,7 +19,7 @@ if not exist "app.ico" goto missing_files
 echo [1/3] Installing PyInstaller...
 py -3.14 -m pip --version >nul 2>&1
 if errorlevel 1 py -3.14 -m ensurepip --upgrade
-py -3.14 -m pip install --upgrade pyinstaller
+py -3.14 -m pip install "pyinstaller>=6.15,<7"
 if errorlevel 1 goto build_failed
 
 echo.
@@ -39,7 +39,7 @@ echo.
 echo ===================================================
 echo SUCCESS: release\YuanshenStart.exe
 echo You can double-click this EXE without Python.
-echo Data is stored in release\data by default.
+echo Data is stored in the per-user LocalAppData folder.
 echo ===================================================
 echo.
 explorer "release"

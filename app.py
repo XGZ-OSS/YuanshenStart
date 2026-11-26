@@ -22,11 +22,14 @@ import re
 import shutil
 import copy
 import time
+import math
+import tempfile
+from decimal import Decimal, ROUND_HALF_EVEN
 from datetime import datetime
 from pathlib import Path
 
 APP = "沅神启动"
-APP_VERSION = "4.3"
+APP_VERSION = "4.4"
 BG = "#F2F9F1"
 CARD = "#FFFFFF"
 INK = "#365C45"
@@ -87,7 +90,7 @@ def timestamp():
 def empty_data():
     return {"format_version": 2, "settings": copy.deepcopy(DEFAULT_SETTINGS),
             "next_id": 1, "members": [], "gifts": [], "gameplays": [],
-            "gift_records": [], "play_records": []}
+            "gift_records": [], "play_records": [], "scenes": ["默认场次"], "active_scene": "默认场次"}
 
 
 def number(tenths):
@@ -120,6 +123,13 @@ def parse_rate(value):
     if not 1 <= tenths <= 99:
         raise ValueError("倍率必须在 0.1～9.9 之间")
     return tenths / 10
+
+
+def finite_number(value):
+    try:
+        return math.isfinite(value)
+    except (TypeError, OverflowError):
+        return False
 
 
 def normalize_data(raw):
@@ -162,10 +172,10 @@ def normalize_data(raw):
                     raise ValueError(f"{field} 存在无效名称")
             if field == "members":
                 row["base"] = row.get("base", 0)
-                if type(row["base"]) not in (int, float):
+                if type(row["base"]) not in (int, float) or not finite_number(row["base"]):
                     raise ValueError("基础积分无效")
             if field == "gifts":
-                if type(row.get("value")) not in (int, float):
+                if type(row.get("value")) not in (int, float) or not finite_number(row.get("value")):
                     raise ValueError("礼物价值无效")
                 # is_exhibit 是 v3.4 原始语义，统一为 is_museum，保存时同步
                 mark = bool(row.get("is_museum", row.get("is_exhibit", False)))
@@ -173,7 +183,7 @@ def normalize_data(raw):
                 row["is_exhibit"] = mark
                 row["blocked"] = bool(row.get("blocked", False))
             if field == "gameplays":
-                if type(row.get("cost")) not in (int, float):
+                if type(row.get("cost")) not in (int, float) or not finite_number(row.get("cost")):
                     raise ValueError("玩法花费无效")
             if field == "gift_records":
                 if any(type(row.get(k)) is not int for k in ("member_id", "gift_id", "count")):
@@ -283,6 +293,7 @@ class YuanshenApp(ttk.Frame):
         self.redo_stack = []
         self.max_undo = 20
         self.dirty = False
+        self._startup_unrecoverable = False
         self.load_message = ""
         self.active_section = "成员"
         self.member_var = tk.StringVar()
@@ -558,7 +569,7 @@ class YuanshenApp(ttk.Frame):
         for path in candidates:
             try:
                 self.data = self._read_json(path)
-                self._atomic_write(self._json_text(), backup=False)
+                self._atomic_write(self._json_text(), backup=True)
                 self.load_message = "已从备份恢复"
                 return
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -575,7 +586,13 @@ class YuanshenApp(ttk.Frame):
         if not self.data_path.exists():
             return
         # 不从已损坏的内容生成新备份。
-        self._read_json(self.data_path)
+        try:
+            self._read_json(self.data_path)
+        except (ValueError, TypeError, UnicodeError, OverflowError):
+            # Preserve damaged bytes separately; never overwrite good backups.
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            shutil.copy2(self.data_path, self.data_dir / f"积分数据.损坏-{stamp}.json")
+            return
         shutil.copy2(self.data_path, self.fixed_backup)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         dest = self.data_dir / f"积分数据.备份-{stamp}.json"
@@ -590,7 +607,9 @@ class YuanshenApp(ttk.Frame):
             old.unlink()
 
     def _atomic_write(self, text, backup=True):
-        tmp = self.data_dir / "积分数据.json.tmp"
+        fd, name = tempfile.mkstemp(prefix="积分数据-", suffix=".tmp", dir=self.data_dir)
+        os.close(fd)
+        tmp = Path(name)
         try:
             if backup and self.data_path.exists():
                 self._backup_current()
@@ -601,6 +620,7 @@ class YuanshenApp(ttk.Frame):
             os.replace(tmp, self.data_path)
             self.last_saved_text = text
             self.dirty = False
+            self._startup_unrecoverable = False
         finally:
             if tmp.exists():
                 try:
@@ -612,6 +632,11 @@ class YuanshenApp(ttk.Frame):
         if self.autosave_job is not None:
             self.after_cancel(self.autosave_job)
             self.autosave_job = None
+        if self._startup_unrecoverable:
+            self._status("原数据损坏：请先恢复备份或导入有效数据")
+            return False
+        if not self.dirty:
+            return True
         text = self._json_text()
         if text == self.last_saved_text:
             self.dirty = False
@@ -707,14 +732,14 @@ class YuanshenApp(ttk.Frame):
     def _gift_points(self, record, gift):
         rate = (self.data["settings"]["museum_rate"] if gift["is_museum"]
                 else self.data["settings"]["normal_rate"])
-        return int(round(gift["value"] * rate_tenths(rate) * record["count"]))
+        return int((Decimal(str(gift["value"])) * rate_tenths(rate) * record["count"]).to_integral_value(rounding=ROUND_HALF_EVEN))
 
     def _game_points(self, record, game):
-        return int(round(game["cost"] * 10 * record["times"]))
+        return int((Decimal(str(game["cost"])) * 10 * record["times"]).to_integral_value(rounding=ROUND_HALF_EVEN))
 
     def _calculate(self):
         totals = {
-            m["id"]: {"base": int(round(m["base"] * 10)), "gift": 0, "spent": 0}
+            m["id"]: {"base": int((Decimal(str(m["base"])) * 10).to_integral_value(rounding=ROUND_HALF_EVEN)), "gift": 0, "spent": 0}
             for m in self.data["members"]
         }
         gift_counts = {}
@@ -1248,6 +1273,12 @@ class YuanshenApp(ttk.Frame):
         self._changed("记录已删除")
 
     def _record(self, kind, member_id, item_id, count):
+        item = self._lookup("gifts" if kind == "gift" else "gameplays").get(item_id)
+        if (kind not in ("gift", "play") or member_id not in self._lookup("members")
+                or item is None or (kind == "gift" and item.get("blocked"))
+                or type(count) is not int or count <= 0):
+            self._status("登记失败：成员、项目或数量已失效，请重新选择")
+            return False
         self._remember()
         base = {"id": self._new_id(), "member_id": member_id,
                 "time": timestamp()}
@@ -1258,6 +1289,7 @@ class YuanshenApp(ttk.Frame):
             base.update(gameplay_id=item_id, times=count)
             self.data["play_records"].append(base)
         self._changed("登记成功")
+        return True
 
     def _open_quick(self):
         if self.quick_window and self.quick_window.winfo_exists():
@@ -1316,7 +1348,8 @@ class YuanshenApp(ttk.Frame):
             if member_id is None:
                 self._status("请先选择成员")
                 return
-            self._record("gift", member_id, gift["id"], self.quantity_var.get())
+            if not self._record("gift", member_id, gift["id"], self.quantity_var.get()):
+                return
             set_qty(1)
             # 快捷键可以连续登记；按钮列表按打开时的排序固定
             self._status("收礼登记成功：" + gift["name"])
@@ -1353,7 +1386,7 @@ class YuanshenApp(ttk.Frame):
             ttk.Button(body, text="更多礼物…", style="Compact.TButton",
                        command=other_gifts).pack(fill="x", pady=(5, 0))
         ttk.Button(body, text="登记玩法消耗", style="Secondary.TButton",
-                   command=lambda: self._quick_play(member_ids)).pack(fill="x", pady=(10, 5))
+                   command=lambda: self._quick_play(member_ids, set_qty)).pack(fill="x", pady=(10, 5))
         ttk.Button(body, text="关闭", style="Compact.TButton",
                    command=win.destroy).pack(fill="x")
         # 局部绑定，不给每个按钮绑定悬停事件；不影响主窗口 Ctrl+Z/Y。
@@ -1363,7 +1396,7 @@ class YuanshenApp(ttk.Frame):
         win.bind("<Escape>", lambda event: win.destroy())
         win.after(50, win.focus_force)
 
-    def _quick_play(self, member_ids):
+    def _quick_play(self, member_ids, set_qty):
         if not self.data["gameplays"]:
             self._status("暂无玩法，请先添加玩法")
             return
@@ -1382,9 +1415,9 @@ class YuanshenApp(ttk.Frame):
             mid = member_ids.get(self.member_var.get())
             gameplay = next((g for g in self.data["gameplays"] if g["name"] == var.get()), None)
             if mid is not None and gameplay:
-                self._record("play", mid, gameplay["id"], self.quantity_var.get())
-                self.quantity_var.set(1)
-                win.destroy()
+                if self._record("play", mid, gameplay["id"], self.quantity_var.get()):
+                    set_qty(1)
+                    win.destroy()
         ttk.Button(body, text="确认扣分", style="Primary.TButton",
                    command=ok).pack(fill="x", pady=18)
 
@@ -1491,7 +1524,7 @@ class YuanshenApp(ttk.Frame):
     def _https_url(value):
         parts = urllib.parse.urlsplit(value)
         if (parts.scheme != "https" or not parts.hostname or parts.username
-                or parts.password or any(c in value for c in ("\\r", "\\n", "\\t"))):
+                or parts.password or any(ord(c) < 32 or ord(c) == 127 for c in value)):
             raise ValueError("更新地址必须使用 HTTPS，不能包含账号密码")
         return value
 
@@ -1733,7 +1766,9 @@ class YuanshenApp(ttk.Frame):
                         os.fsync(target.fileno())
                 if total and size != total:
                     raise ValueError(f"下载不完整：预期 {total} 字节，实际 {size} 字节")
-                if size < 10000 or temp.open("rb").read(2) != b"MZ":
+                with temp.open("rb") as downloaded:
+                    magic = downloaded.read(2)
+                if size < 10000 or magic != b"MZ":
                     raise ValueError("下载文件不是 Windows EXE")
                 self.update_events.put(("stage", "校验 SHA-256 文件完整性…", None))
                 if digest.hexdigest() != info["sha256"]:
@@ -1786,22 +1821,28 @@ class YuanshenApp(ttk.Frame):
             if key.startswith("_PYI_") or key.startswith("PYINSTALLER_"):
                 clean_env.pop(key, None)
         clean_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-        subprocess.Popen(
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        kernel.SetDllDirectoryW(None)
+        try:
+            subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
              "-EncodedCommand", encoded],
             cwd=str(exe.parent),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             env=clean_env,
-        )
+            )
+        finally:
+            kernel.SetDllDirectoryW(str(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else None)
 
     def _poll_updates(self):
         try:
             while True:
                 event, data, extra = self.update_events.get_nowait()
                 if event == "checked":
-                    self.update_busy = False
                     if self._version(data["version"]) <= self._version(APP_VERSION):
+                        self.update_busy = False
                         self._status(f"已是最新版 v{APP_VERSION}")
                         if extra:
                             messagebox.showinfo("检查更新", f"当前已是最新版 v{APP_VERSION}",
@@ -1809,6 +1850,8 @@ class YuanshenApp(ttk.Frame):
                     elif self._show_update_notes(data):
                         self.update_busy = True
                         self._download_update(data)
+                    else:
+                        self.update_busy = False
                 elif event == "progress":
                     self._apply_download_progress(data, extra)
                 elif event == "stage":
@@ -1866,6 +1909,7 @@ class YuanshenApp(ttk.Frame):
             self.autosave_job = None
         self._remember()
         self.data = reloaded
+        self._startup_unrecoverable = False
         self.last_saved_text = self._json_text()
         self.dirty = False
         self._refresh_all()
@@ -2035,6 +2079,7 @@ class YuanshenApp(ttk.Frame):
             return
         self._remember()
         self.data = incoming
+        self._startup_unrecoverable = False
         self._changed("已继承旧版数据，正在自动保存")
         messagebox.showinfo(
             "导入完成",
@@ -2066,6 +2111,7 @@ class YuanshenApp(ttk.Frame):
             return
         self._remember()
         self.data = incoming
+        self._startup_unrecoverable = False
         self._changed("已导入 JSON 数据，正在自动保存")
 
     def _import_csv(self):
@@ -2170,6 +2216,9 @@ class YuanshenApp(ttk.Frame):
         self._switch("成员")
 
     def _close(self):
+        if self._startup_unrecoverable and not self.dirty:
+            self.root.destroy()
+            return
         if not self._save_now():
             messagebox.showerror("无法安全退出",
                                  "自动保存失败，程序将继续保持打开。\n"
